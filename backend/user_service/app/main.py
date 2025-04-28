@@ -1,11 +1,19 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import uvicorn
+
+import models
+import database
+from database import engine, get_db
+
+# Create database tables
+models.Base.metadata.create_all(bind=engine)
 
 # Security configurations
 SECRET_KEY = "your-secret-key-here"  # In production, use a secure secret key
@@ -16,15 +24,24 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# User model
-class User(BaseModel):
+# Pydantic models for request/response
+class UserBase(BaseModel):
     username: str
     email: Optional[str] = None
     full_name: Optional[str] = None
     disabled: Optional[bool] = None
 
-class UserInDB(User):
-    hashed_password: str
+    class Config:
+        from_attributes = True
+
+class UserCreate(UserBase):
+    password: str
+
+class User(UserBase):
+    id: int
+
+    class Config:
+        from_attributes = True
 
 class Token(BaseModel):
     access_token: str
@@ -32,9 +49,6 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     username: Optional[str] = None
-
-# In-memory user database (replace with real database in production)
-fake_users_db = {}
 
 app = FastAPI()
 
@@ -44,14 +58,11 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return pwd_context.hash(password)
 
-def get_user(db, username: str):
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
-    return None
+def get_user(db: Session, username: str):
+    return db.query(models.User).filter(models.User.username == username).first()
 
-def authenticate_user(fake_db, username: str, password: str):
-    user = get_user(fake_db, username)
+def authenticate_user(db: Session, username: str, password: str):
+    user = get_user(db, username)
     if not user:
         return False
     if not verify_password(password, user.hashed_password):
@@ -68,9 +79,12 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
     credentials_exception = HTTPException(
-        status_code=401,
+        status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
@@ -82,32 +96,40 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         token_data = TokenData(username=username)
     except JWTError:
         raise credentials_exception
-    user = get_user(fake_users_db, username=token_data.username)
+    
+    user = get_user(db, username=token_data.username)
     if user is None:
         raise credentials_exception
     return user
 
 @app.post("/register", response_model=User)
-async def register_user(user: User, password: str):
-    if user.username in fake_users_db:
+async def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
+    db_user = get_user(db, username=user_data.username)
+    if db_user:
         raise HTTPException(status_code=400, detail="Username already registered")
-    hashed_password = get_password_hash(password)
-    user_in_db = UserInDB(
-        username=user.username,
-        email=user.email,
-        full_name=user.full_name,
-        disabled=user.disabled,
+    
+    hashed_password = get_password_hash(user_data.password)
+    db_user = models.User(
+        username=user_data.username,
+        email=user_data.email,
+        full_name=user_data.full_name,
+        disabled=user_data.disabled,
         hashed_password=hashed_password
     )
-    fake_users_db[user.username] = user_in_db.dict()
-    return user
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
 
 @app.post("/token", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = authenticate_user(fake_users_db, form_data.username, form_data.password)
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
-            status_code=401,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
@@ -118,7 +140,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.get("/users/me", response_model=User)
-async def read_users_me(current_user: User = Depends(get_current_user)):
+async def read_users_me(current_user: models.User = Depends(get_current_user)):
     return current_user
 
 if __name__ == "__main__":

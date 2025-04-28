@@ -37,6 +37,7 @@ ENV/
 *.db
 *.sqlite3
 sql_app.db
+users.db
 
 # Logs
 *.log
@@ -48,4 +49,11 @@ sql_app.db
 
 # OS specific
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Project specific
+backend/user_service/app/*.db
+backend/user_service/app/*.sqlite3
+.pytest_cache/
+coverage.xml
+.coverage 
